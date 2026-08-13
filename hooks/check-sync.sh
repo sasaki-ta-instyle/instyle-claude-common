@@ -10,7 +10,16 @@
 #   4. $HOME/instyle-claude-mebius  (メビウス社員 Mac)
 # それぞれ .git の存在で有効性を判定する。sasaki Mac は sasaki を指す、
 # team メンバーは team を指す、というふうに 1 台 1 repo で当たる想定。
+#
+# opt-out:
+#   `~/.config/instyle-claude-sync/off` を作れば hook が無音終了する。
+#   復帰は `rm ~/.config/instyle-claude-sync/off`。
 set -u
+
+# ---- opt-out flag ----
+if [ -f "$HOME/.config/instyle-claude-sync/off" ]; then
+  exit 0
+fi
 
 REPO=""
 if [ -n "${INSTYLE_CLAUDE_REPO:-}" ] && [ -d "$INSTYLE_CLAUDE_REPO/.git" ]; then
@@ -30,7 +39,17 @@ fi
 [ -n "$REPO" ] || exit 0
 
 # fetch（5 秒タイムアウト）。失敗してもセッション開始を妨げない。
-if ! timeout 5 git -C "$REPO" fetch --quiet origin main 2>/dev/null; then
+# macOS には timeout(1) が標準で無いため、GNU coreutils の gtimeout があればそれを、
+# 無ければタイムアウト無しでフォールバック（fetch 自体は --quiet でネットワーク断時に
+# git が数秒で返すので実運用上の実害は小さい）。
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="timeout 5"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="gtimeout 5"
+else
+  TIMEOUT_CMD=""
+fi
+if ! $TIMEOUT_CMD git -C "$REPO" fetch --quiet origin main 2>/dev/null; then
   exit 0
 fi
 
@@ -41,9 +60,9 @@ log="$(git -C "$REPO" log --oneline --no-decorate HEAD..origin/main 2>/dev/null 
 repo_name="$(basename "$REPO")"
 
 # JSON エンコード（python3 で安全に）
-python3 - "$behind" "$log" "$repo_name" <<'PY'
+python3 - "$behind" "$log" "$repo_name" "$REPO" <<'PY'
 import json, sys
-behind, log, repo_name = sys.argv[1], sys.argv[2], sys.argv[3]
+behind, log, repo_name, repo_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 
 # repo 名で notification 文言を出し分ける（1 台 1 repo の想定）
 if repo_name == "instyle-claude-sasaki":
@@ -59,8 +78,34 @@ msg = (
     f"[{repo_name} 同期通知] origin/main に未取得の変更が {behind} 件あります "
     f"（{origin_note}）。\n\n"
     f"{log}\n\n"
-    f"反映する場合: `cd ~/{repo_name} && git pull && ./bootstrap.sh`\n\n"
-    f"ユーザーに同期するか確認してください。"
+    "=== ユーザーへの応答手順（Claude が実行） ===\n\n"
+    f"1. ユーザーに「`{repo_name}` に {behind} 件の未取得があります。同期しますか？」"
+    "と 1 行で聞く（挨拶や説明は付けない）。\n\n"
+    "2. ユーザーの返答が **Yes 系**（`はい` / `yes` / `Y` / `y` / `おk` / `お願い` / "
+    "`OK` / `ok` / `同期して` / `pull して` / `やって` / `どうぞ`）なら、Bash tool で "
+    "以下を **1 回の呼び出し**として実行する:\n\n"
+    "   ```\n"
+    f"   cd '{repo_path}' && git pull --ff-only && ./bootstrap.sh --auto\n"
+    "   ```\n\n"
+    "   実行結果（成功 / 失敗 / stderr の要約）を **1〜2 行**でユーザーに報告する。\n"
+    "   成功時は「✓ 同期完了（N commits 反映）。`~/.claude/` 配下の hook / skills / "
+    "settings.json 変更は **次回 claude 起動時から有効** になります。」を末尾に付け加える。\n\n"
+    "3. **No 系**（`いいえ` / `no` / `n` / `やめて` / `後で` / `skip` / `パス`）なら、"
+    "「了解、スキップしました」とだけ返す。以降このセッション中は再度聞かない。\n\n"
+    "4. **どちらとも取れない曖昧な返答**（新しいタスクの依頼 / 別の話題）が来たら、"
+    "同期は保留してその新タスクを優先する。再度聞き直さない。\n\n"
+    "5. `git pull` が **conflict / non-fast-forward** で失敗したら、`git stash` や "
+    "手動 merge を Claude が勝手にやらない。「pull で conflict が出ました。手動対応が必要です: "
+    f"`cd {repo_path} && git status`」と 1 行で報告して停止。\n\n"
+    "6. `./bootstrap.sh --auto` が **exit 1** で失敗したら、末尾 10 行の出力を"
+    "そのまま貼って「bootstrap が失敗しました。手動確認が必要です」と報告して停止。\n\n"
+    "=== 同期を毎回聞かれたくない場合 ===\n"
+    "ユーザーが「今後聞かないで」「毎回聞くの面倒」と明示したら、以下を実行して "
+    "この hook を無音化する:\n"
+    "   ```\n"
+    "   mkdir -p ~/.config/instyle-claude-sync && touch ~/.config/instyle-claude-sync/off\n"
+    "   ```\n"
+    "復帰は `rm ~/.config/instyle-claude-sync/off`。"
 )
 print(json.dumps({
     "hookSpecificOutput": {
